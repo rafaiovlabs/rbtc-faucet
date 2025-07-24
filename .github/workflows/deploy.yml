@@ -1,0 +1,249 @@
+name: Build and Deploy to ECR and Kubernetes
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - features/k8s-deployment
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - testing
+          - qa
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPOSITORY: rbtc-faucet
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image-uri: ${{ steps.build-image.outputs.image }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        IMAGE_TAG: ${{ env.IMAGE_TAG }}
+      run: |
+        # Build a docker container and push it to ECR
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        
+        # Also tag as latest for the current branch
+        if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        fi
+        
+        # Also tag with branch name
+        BRANCH_NAME=$(echo ${GITHUB_REF#refs/heads/} | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]')
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$BRANCH_NAME-latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$BRANCH_NAME-latest
+        
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Install kubectl
+      uses: azure/setup-kubectl@v4
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubectl for EKS
+      run: |
+        aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+    - name: Determine environment
+      id: env
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+        elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          echo "environment=prod" >> $GITHUB_OUTPUT
+        elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+          echo "environment=dev" >> $GITHUB_OUTPUT
+        else
+          echo "environment=dev" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Create namespace if not exists
+      run: |
+        kubectl create namespace rbtc-faucet-${{ steps.env.outputs.environment }} --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Create or update deployment
+      env:
+        IMAGE_URI: ${{ needs.build-and-push.outputs.image-uri }}
+        ENVIRONMENT: ${{ steps.env.outputs.environment }}
+      run: |
+        # Create deployment YAML
+        cat <<EOF > deployment.yaml
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: rbtc-faucet
+          namespace: rbtc-faucet-$ENVIRONMENT
+          labels:
+            app: rbtc-faucet
+            environment: $ENVIRONMENT
+        spec:
+          replicas: 2
+          selector:
+            matchLabels:
+              app: rbtc-faucet
+              environment: $ENVIRONMENT
+          template:
+            metadata:
+              labels:
+                app: rbtc-faucet
+                environment: $ENVIRONMENT
+            spec:
+              containers:
+              - name: rbtc-faucet
+                image: $IMAGE_URI
+                ports:
+                - containerPort: 3000
+                env:
+                - name: NODE_ENV
+                  value: "production"
+                - name: ENVIRONMENT
+                  value: "$ENVIRONMENT"
+                resources:
+                  requests:
+                    memory: "256Mi"
+                    cpu: "250m"
+                  limits:
+                    memory: "512Mi"
+                    cpu: "500m"
+                livenessProbe:
+                  httpGet:
+                    path: /
+                    port: 3000
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /
+                    port: 3000
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: rbtc-faucet-service
+          namespace: rbtc-faucet-$ENVIRONMENT
+          labels:
+            app: rbtc-faucet
+            environment: $ENVIRONMENT
+        spec:
+          selector:
+            app: rbtc-faucet
+            environment: $ENVIRONMENT
+          ports:
+          - protocol: TCP
+            port: 80
+            targetPort: 3000
+          type: ClusterIP
+        ---
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: rbtc-faucet-ingress
+          namespace: rbtc-faucet-$ENVIRONMENT
+          labels:
+            app: rbtc-faucet
+            environment: $ENVIRONMENT
+          annotations:
+            kubernetes.io/ingress.class: "nginx"
+            nginx.ingress.kubernetes.io/ssl-redirect: "true"
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+            cert-manager.io/cluster-issuer: "letsencrypt-prod"
+        spec:
+          tls:
+          - hosts:
+            - rbtc-faucet-$ENVIRONMENT.yourdomain.com
+            secretName: rbtc-faucet-$ENVIRONMENT-tls
+          rules:
+          - host: rbtc-faucet-$ENVIRONMENT.yourdomain.com
+            http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: rbtc-faucet-service
+                    port:
+                      number: 80
+        EOF
+
+    - name: Apply Kubernetes manifests
+      run: |
+        kubectl apply -f deployment.yaml
+
+    - name: Wait for deployment to be ready
+      run: |
+        kubectl rollout status deployment/rbtc-faucet -n rbtc-faucet-${{ steps.env.outputs.environment }} --timeout=300s
+
+    - name: Get deployment status
+      run: |
+        kubectl get pods -n rbtc-faucet-${{ steps.env.outputs.environment }} -l app=rbtc-faucet
+        kubectl get services -n rbtc-faucet-${{ steps.env.outputs.environment }}
+        kubectl get ingress -n rbtc-faucet-${{ steps.env.outputs.environment }}
+
+    - name: Verify deployment
+      run: |
+        echo "Deployment completed successfully!"
+        echo "Image: ${{ needs.build-and-push.outputs.image-uri }}"
+        echo "Environment: ${{ steps.env.outputs.environment }}"
+        echo "Namespace: rbtc-faucet-${{ steps.env.outputs.environment }}"

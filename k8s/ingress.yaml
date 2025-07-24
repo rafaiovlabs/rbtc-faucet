@@ -1,0 +1,31 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rbtc-faucet-ingress
+  namespace: rbtc-faucet-${ENVIRONMENT}
+  labels:
+    app: rbtc-faucet
+    environment: ${ENVIRONMENT}
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+spec:
+  tls:
+  - hosts:
+    - rbtc-faucet-${ENVIRONMENT}.yourdomain.com
+    secretName: rbtc-faucet-${ENVIRONMENT}-tls
+  rules:
+  - host: rbtc-faucet-${ENVIRONMENT}.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rbtc-faucet-service
+            port:
+              number: 80
