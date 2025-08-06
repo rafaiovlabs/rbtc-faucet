@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - develop
+      - features/k8s-deployment
   pull_request:
     branches:
       - main
@@ -27,8 +28,12 @@ env:
 
 jobs:
   build-and-push:
+    permissions:
+      id-token: write
+      contents: read
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
+    environment: dev
     outputs:
       image-uri: ${{ steps.build-image.outputs.image }}
     
@@ -39,9 +44,9 @@ jobs:
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ secrets.DEV_ROLE_ARN }}
+        role-session-name: GitHubActions
+        aws-region: ${{ secrets.AWS_REGION }}
 
     - name: Login to Amazon ECR
       id: login-ecr
@@ -54,31 +59,33 @@ jobs:
       id: build-image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         IMAGE_TAG: ${{ env.IMAGE_TAG }}
       run: |
-        # Build a docker container and push it to ECR
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        # Determine branch name for tagging
+        BRANCH_NAME=$(echo ${GITHUB_REF#refs/heads/} | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]')
         
-        # Also tag as latest for the current branch
+        # Build tags array
+        TAGS="-t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:$BRANCH_NAME-latest"
+        
+        # Add latest tag for main branch
         if [ "${{ github.ref }}" = "refs/heads/main" ]; then
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          TAGS="$TAGS -t $ECR_REGISTRY/$ECR_REPOSITORY:latest"
         fi
         
-        # Also tag with branch name
-        BRANCH_NAME=$(echo ${GITHUB_REF#refs/heads/} | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]')
-        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$BRANCH_NAME-latest
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$BRANCH_NAME-latest
+        # Build and push image with all tags using buildx
+        docker buildx build --platform linux/amd64 --push $TAGS .
         
         echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
   deploy:
+    permissions:
+      id-token: write
+      contents: read
     name: Deploy to Kubernetes
     runs-on: ubuntu-latest
     needs: build-and-push
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    environment: dev
     
     steps:
     - name: Checkout code
@@ -87,9 +94,8 @@ jobs:
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ secrets.DEV_ROLE_ARN }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
     - name: Install kubectl
       uses: azure/setup-kubectl@v4
@@ -115,7 +121,7 @@ jobs:
 
     - name: Create namespace if not exists
       run: |
-        kubectl create namespace rbtc-faucet-${{ steps.env.outputs.environment }} --dry-run=client -o yaml | kubectl apply -f -
+        kubectl create namespace rbtcfaucet-${{ steps.env.outputs.environment }} --dry-run=client -o yaml | kubectl apply -f -
 
     - name: Substitute environment variables in manifests
       env:
@@ -140,48 +146,30 @@ jobs:
         echo "Content of deployment.yaml:"
         cat k8s-processed/deployment.yaml
 
-    - name: Apply ConfigMap
-      run: |
-        if [ -f "k8s-processed/configmap.yaml" ]; then
-          kubectl apply -f k8s-processed/configmap.yaml
-        fi
-
-    - name: Apply Service
-      run: |
-        if [ -f "k8s-processed/service.yaml" ]; then
-          kubectl apply -f k8s-processed/service.yaml
-        fi
-
     - name: Apply Deployment
       run: |
-        if [ -f "k8s-processed/deployment.yaml" ]; then
-          kubectl apply -f k8s-processed/deployment.yaml
-        fi
-
-    - name: Apply Ingress
-      run: |
-        if [ -f "k8s-processed/ingress.yaml" ]; then
-          kubectl apply -f k8s-processed/ingress.yaml
+        if [ -f "k8s/deployment.yaml" ]; then
+          kubectl apply -f k8s/deployment.yaml -n rbtcfaucet-${{ steps.env.outputs.environment }}
         fi
 
     - name: Wait for deployment to be ready
       run: |
-        kubectl rollout status deployment/rbtc-faucet -n rbtc-faucet-${{ steps.env.outputs.environment }} --timeout=300s
+        kubectl rollout status deployment/rbtcfaucet -n rbtcfaucet-${{ steps.env.outputs.environment }} --timeout=300s
 
     - name: Get deployment status
       run: |
         echo "=== Pods ==="
-        kubectl get pods -n rbtc-faucet-${{ steps.env.outputs.environment }} -l app=rbtc-faucet
+        kubectl get pods -n rbtcfaucet-${{ steps.env.outputs.environment }} 
         echo "=== Services ==="
-        kubectl get services -n rbtc-faucet-${{ steps.env.outputs.environment }}
+        kubectl get services -n rbtcfaucet-${{ steps.env.outputs.environment }}
         echo "=== Ingress ==="
-        kubectl get ingress -n rbtc-faucet-${{ steps.env.outputs.environment }}
+        kubectl get ingress -n rbtcfaucet-${{ steps.env.outputs.environment }}
         echo "=== Events ==="
-        kubectl get events -n rbtc-faucet-${{ steps.env.outputs.environment }} --sort-by='.lastTimestamp' | tail -10
+        kubectl get events -n rbtcfaucet-${{ steps.env.outputs.environment }} --sort-by='.lastTimestamp' | tail -10
 
     - name: Verify deployment
       run: |
         echo "Deployment completed successfully!"
         echo "Image: ${{ needs.build-and-push.outputs.image-uri }}"
         echo "Environment: ${{ steps.env.outputs.environment }}"
-        echo "Namespace: rbtc-faucet-${{ steps.env.outputs.environment }}"
+        echo "Namespace: rbtcfaucet-${{ steps.env.outputs.environment }}"

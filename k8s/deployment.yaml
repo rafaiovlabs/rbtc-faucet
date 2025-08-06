@@ -1,59 +1,50 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rbtc-faucet
-  namespace: rbtc-faucet-${ENVIRONMENT}
+  name: rbtcfaucet
   labels:
-    app: rbtc-faucet
-    environment: ${ENVIRONMENT}
+    app.kubernetes.io/created-by: platform-eng
+    app.kubernetes.io/type: app
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
-      app: rbtc-faucet
-      environment: ${ENVIRONMENT}
+      app.kubernetes.io/name: rbtcfaucet
+      app.kubernetes.io/instance: rbtcfaucet
+      app.kubernetes.io/component: service
   template:
     metadata:
       labels:
-        app: rbtc-faucet
-        environment: ${ENVIRONMENT}
+        app.kubernetes.io/name: rbtcfaucet
+        app.kubernetes.io/instance: rbtcfaucet
+        app.kubernetes.io/component: service
+        app.kubernetes.io/created-by: platform-eng
     spec:
       containers:
-      - name: rbtc-faucet
-        image: ${IMAGE_URI}
-        ports:
-        - containerPort: 3000
-        env:
-        - name: NODE_ENV
-          value: "production"
-        - name: ENVIRONMENT
-          value: "${ENVIRONMENT}"
-        resources:
-          requests:
-            memory: "256Mi"
-            cpu: "250m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
-        livenessProbe:
-          httpGet:
-            path: /
-            port: 3000
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
-          failureThreshold: 3
-        readinessProbe:
-          httpGet:
-            path: /
-            port: 3000
-          initialDelaySeconds: 5
-          periodSeconds: 5
-          timeoutSeconds: 3
-          failureThreshold: 3
-        # Add any secrets or config maps here
-        # envFrom:
-        # - secretRef:
-        #     name: rbtc-faucet-secrets
-        # - configMapRef:
-        #     name: rbtc-faucet-config
+        - name: rbtcfaucet
+          image: "666927241564.dkr.ecr.us-east-1.amazonaws.com/rbtcfaucet-dev:latest"
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: ARCH
+              value: "amd64"
+        - name: redis
+          image: "redis:latest"
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          env:
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "6379"
+          volumeMounts:
+            - mountPath: /data
+              name: redis-data
+      volumes:
+        - name: redis-data
+          emptyDir: {}
